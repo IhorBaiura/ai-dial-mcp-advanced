@@ -1,8 +1,10 @@
 import json
 from collections import defaultdict
-from typing import Any
+from typing import Any, cast
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AsyncStream
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 
 from agent.clients.custom_mcp_client import CustomMCPClient
 from agent.models.message import Message, Role
@@ -27,33 +29,37 @@ class DialClient:
             api_version=""
         )
 
-    def _collect_tool_calls(self, tool_deltas):
+    def _collect_tool_calls(self, tool_deltas: list[ChoiceDeltaToolCall]) -> list[dict[str, Any]]:
         """Convert streaming tool call deltas to complete tool calls"""
-        tool_dict = defaultdict(lambda: {"id": None, "function": {"arguments": "", "name": None}, "type": None})
+        tool_dict: dict[int, dict[str, Any]] = defaultdict(lambda: {"id": None, "function": {"arguments": "", "name": None}, "type": None})
 
         for delta in tool_deltas:
             idx = delta.index
             if delta.id: tool_dict[idx]["id"] = delta.id
-            if delta.function.name: tool_dict[idx]["function"]["name"] = delta.function.name
-            if delta.function.arguments: tool_dict[idx]["function"]["arguments"] += delta.function.arguments
+            if delta.function.name: tool_dict[idx]["function"]["name"] = delta.function.name # type: ignore
+            if delta.function.arguments: tool_dict[idx]["function"]["arguments"] += delta.function.arguments # type: ignore
             if delta.type: tool_dict[idx]["type"] = delta.type
 
         return list(tool_dict.values())
 
     async def _stream_response(self, messages: list[Message]) -> Message:
         """Stream OpenAI response and handle tool calls"""
-        stream = await self.openai.chat.completions.create(
-            **{
-                "model": "gpt-4o",
-                "messages": [msg.to_dict() for msg in messages],
-                "tools": self.tools,
-                "temperature": 0.0,
-                "stream": True
-            }
+
+        params: dict[str, Any] = {
+            "model": "gpt-4o",
+            "messages": [msg.to_dict() for msg in messages],
+            "tools": self.tools,
+            "temperature": 0.0,
+            "stream": True
+        }
+
+        stream: AsyncStream[ChatCompletionChunk] = cast(
+            AsyncStream[ChatCompletionChunk], 
+            await self.openai.chat.completions.create(**params)
         )
 
         content = ""
-        tool_deltas = []
+        tool_deltas: list[ChoiceDeltaToolCall] = []
 
         print("🤖: ", end="", flush=True)
 
@@ -72,24 +78,25 @@ class DialClient:
         return Message(
             role=Role.AI,
             content=content,
-            tool_calls=self._collect_tool_calls(tool_deltas) if tool_deltas else []
+            tool_calls=self._collect_tool_calls(tool_deltas)
         )
 
     async def get_completion(self, messages: list[Message]) -> Message:
         """Process user query with streaming and tool calling"""
         ai_message: Message = await self._stream_response(messages)
 
-        # Check if any tool calls are present and perform them
         if ai_message.tool_calls:
             messages.append(ai_message)
             await self._call_tools(ai_message, messages)
-            # recursively calling agent with tool messages
             return await self.get_completion(messages)
 
         return ai_message
 
-    async def _call_tools(self, ai_message: Message, messages: list[Message]):
+    async def _call_tools(self, ai_message: Message, messages: list[Message]) -> None:
         """Execute tool calls using MCP client"""
+        if not ai_message.tool_calls:
+            return
+
         for tool_call in ai_message.tool_calls:
             tool_name = tool_call["function"]["name"]
             tool_args = json.loads(tool_call["function"]["arguments"])

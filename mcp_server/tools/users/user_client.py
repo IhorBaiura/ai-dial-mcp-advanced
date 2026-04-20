@@ -45,7 +45,7 @@ class UserClient:
     ) -> str:
         headers = {"Content-Type": "application/json"}
 
-        params = {}
+        params: dict[str, str] = {}
         if name:
             params["name"] = name
         if surname:
